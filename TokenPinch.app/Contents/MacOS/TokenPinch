@@ -1,0 +1,9 @@
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="$PATH:$DIR"
+
+# Launch TokenPinch Tray App in the background
+"$DIR/tokenpinch_bin" tray > /dev/null 2>&1 &
+
+# Display a beautiful native notification
+osascript -e 'display notification "Saves up to 90% of your AI budget!" with title "🤏 TokenPinch Activated" subtitle "Proxy Gateway live on Port 8799"'
