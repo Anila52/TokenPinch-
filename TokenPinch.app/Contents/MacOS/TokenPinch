@@ -1,9 +1,14 @@
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
-export PATH="$PATH:$DIR"
-
-# Launch TokenPinch Tray App in the background
-"$DIR/tokenpinch_bin" tray > /dev/null 2>&1 &
-
-# Display a beautiful native notification
-osascript -e 'display notification "Saves up to 90% of your AI budget!" with title "🤏 TokenPinch Activated" subtitle "Proxy Gateway live on Port 8799"'
+BIN="$DIR/tokenpinch_bin"
+for dir in /usr/local/bin "$HOME/bin" "$HOME/.local/bin"; do
+  case ":$PATH:" in
+    *":$dir:"*) [ -w "$dir" ] && [ ! -e "$dir/tokenpinch" ] && ln -s "$BIN" "$dir/tokenpinch" ;;
+  esac
+done
+if [ ! -s "$HOME/.tokenpinch/license.json" ]; then
+  osascript -e "tell application \"Terminal\" to do script \"exec \\\"$BIN\\\" tray\""
+  exit 0
+fi
+pgrep -x tokenpinch_bin >/dev/null 2>&1 && exit 0
+"$BIN" tray >/dev/null 2>&1 &

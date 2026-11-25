@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You review code."
+  },
+  {
+    "role": "user",
+    "content": "What does target return for 1?\n```python\ndef helper(x):\n    return x + 1\n\ndef target(n):\n    return helper(n) * 2\n\ndef unused(z):\n    return z * 9\n```"
+  }
+]

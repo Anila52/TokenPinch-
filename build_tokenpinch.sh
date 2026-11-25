@@ -3,6 +3,24 @@
 # Exit on any error
 set -e
 
+TARGET="${1:-macos}"
+case "$TARGET" in
+  windows)
+    echo "Build the exe on Windows:"
+    echo "  powershell -ExecutionPolicy Bypass -File build/windows/build.ps1"
+    exit 0
+    ;;
+  android)
+    exec bash "$(cd "$(dirname "$0")" && pwd)/build/android/install.sh"
+    ;;
+  macos)
+    ;;
+  *)
+    echo "Usage: ./build_tokenpinch.sh [macos|windows|android]"
+    exit 2
+    ;;
+esac
+
 echo "🔒 TokenPinch Secure App & Binary Compiler v1.2.0"
 echo "=================================================="
 
@@ -15,26 +33,32 @@ fi
 echo "📦 Installing tiktoken and certifi..."
 pip3 install tiktoken certifi
 
-echo "🧬 Compiling tokenpinch.py with Cython into a native shared library (.so)..."
-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 setup_cython.py build_ext --inplace
+echo "🏗️ Compiling launcher.py into one unsigned Mac binary..."
 
-echo "🏗️ Compiling launcher.py and native library into a single standalone binary..."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+rm -rf dist .pyibuild
 
-# Clean up any old builds
-rm -rf build dist
+ICON="$SCRIPT_DIR/MenuBarIconTemplate.png"
+CACHE="$HOME/.tokenpinch/tiktoken_cache"
+test -f "$ICON"
+test -d "$CACHE"
 
-# Compile into a single, standalone macOS binary utilizing the Cython shared library
 pyinstaller --onefile \
             --name="tokenpinch" \
             --clean \
+            --noconfirm \
+            --distpath "$SCRIPT_DIR/dist" \
+            --workpath "$SCRIPT_DIR/.pyibuild" \
+            --specpath "$SCRIPT_DIR/.pyibuild" \
             --hidden-import="certifi" \
             --hidden-import="tiktoken" \
             --hidden-import="tiktoken_ext" \
             --hidden-import="tiktoken_ext.openai_public" \
             --hidden-import="rumps" \
-            --add-binary="tokenpinch.cpython-313-darwin.so:." \
-            --add-data="/Users/Tariq/.tokenpinch/tiktoken_cache:tiktoken_cache" \
-            launcher.py
+            --add-data="$ICON:." \
+            --add-data="$CACHE:tiktoken_cache" \
+            "$SCRIPT_DIR/launcher.py"
 
 echo "📦 Creating native macOS App Bundle (TokenPinch.app)..."
 
@@ -46,6 +70,8 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 # Create standard macOS directory structure
 mkdir -p "$MACOS_DIR"
 mkdir -p "$RESOURCES_DIR"
+cp "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+cp "$SCRIPT_DIR/MenuBarIconTemplate.png" "$RESOURCES_DIR/MenuBarIconTemplate.png"
 
 # Copy compiled binary to MacOS directory as the payload
 cp "dist/tokenpinch" "$MACOS_DIR/tokenpinch_bin"
@@ -54,13 +80,18 @@ cp "dist/tokenpinch" "$MACOS_DIR/tokenpinch_bin"
 cat << 'EOF' > "$MACOS_DIR/TokenPinch"
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
-export PATH="$PATH:$DIR"
-
-# Launch TokenPinch Tray App in the background
-"$DIR/tokenpinch_bin" tray > /dev/null 2>&1 &
-
-# Display a beautiful native notification
-osascript -e 'display notification "Saves up to 90% of your AI budget!" with title "🤏 TokenPinch Activated" subtitle "Proxy Gateway live on Port 8799"'
+BIN="$DIR/tokenpinch_bin"
+for dir in /usr/local/bin "$HOME/bin" "$HOME/.local/bin"; do
+  case ":$PATH:" in
+    *":$dir:"*) [ -w "$dir" ] && [ ! -e "$dir/tokenpinch" ] && ln -s "$BIN" "$dir/tokenpinch" ;;
+  esac
+done
+if [ ! -s "$HOME/.tokenpinch/license.json" ]; then
+  osascript -e "tell application \"Terminal\" to do script \"exec \\\"$BIN\\\" tray\""
+  exit 0
+fi
+pgrep -x tokenpinch_bin >/dev/null 2>&1 && exit 0
+"$BIN" tray >/dev/null 2>&1 &
 EOF
 
 # Make the launcher script executable

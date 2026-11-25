@@ -1,6 +1,6 @@
-# 🤏 TokenPinch — Save Up to 90% of Your LLM Prompt Costs
+# 🤏 TokenPinch — Cut input tokens by up to 91% on large code files
 
-**TokenPinch** is a high-performance, native developer utility for macOS, Windows, and Android designed to optimize, scrub, and compress LLM prompts. By intercepting, caching, and intelligently slicing your context locally, TokenPinch cuts your OpenAI & Anthropic API expenses by up to 90% while keeping your prompts lean and secure.
+**TokenPinch** runs on a Mac, a Windows PC, and Android. It turns a large code file into a compact skeleton before you paste it into Claude, ChatGPT or Cursor. In tests, a large file went from about 4,000 input tokens to about 350. That is an input-token cut on that file, not a cut of the whole API bill.
 
 ---
 
@@ -12,42 +12,27 @@
 * **🌐 Claude-3.5 Failover Proxy Routing:** Local gateway automatically catches OpenAI upstream rate-limits (`429`) or server errors (`5xx`), translates the payloads on-the-fly, and failovers to Anthropic's Claude 3.5 with full streaming/SSE support.
 * **🖥️ Beautiful TUI Dashboard:** Run `tokenpinch status` for an interactive, colorized ANSI terminal dashboard showing total cash saved, active proxy runs, and an ASCII runway bar meter.
 * **🔌 Integration Guides:** Built-in templates for instant setup with VS Code, Cursor IDE, Python scripts, and Node.js (`tokenpinch client <client>`).
-* **🛡️ 100% Encrypted & Secure Native Binary:** The core engine is fully compiled to native machine/assembly code, protecting intellectual property and preventing decompiling across macOS, Windows, and Android.
+* **🛡️ On your machine:** Your code stays on the Mac, Windows PC, or Android phone. TokenPinch goes online only to check the licence.
 
 ---
 
 ## 📦 What's Included in the Box
 
-1. **Standalone CLI Binary (`tokenpinch`):** Blazing fast native binary for terminal execution and scripting.
-2. **macOS Status Tray Menu App (`TokenPinch.app`):** Elegant background execution with live toggles and beautiful native desktop notifications.
-3. **Windows & Android Clients:** Lightweight, native clients for seamless cross-platform support.
-4. **Professional Installer (`TokenPinch.dmg`):** A standard, signed macOS Disk Image for seamless installation.
-5. **Decompiler Plugins:** Pre-bundled optimization scripts for IDA Pro and Ghidra.
+1. **`TokenPinch.dmg`:** the Apple Silicon app. It is not notarised yet. The `tokenpinch` command is this same app.
+2. **IDA Pro and Ghidra plugins:** in that disk image.
+3. **Windows and Android:** not in the download.
 
 ---
 
-## 🛠️ Quick Start
+## Install
 
-### 1. Installation
-Install the appropriate package for your platform (e.g. run the `.dmg` on Mac, `.msi` on Windows, or install the `.apk` on Android).
-
-### 2. Configure Your Gateway
-Launch the Tray Menu App or start the daemon:
-```bash
-tokenpinch gateway --port 8799
-```
-
-### 3. Native Status Checking
-Run the TUI dashboard to view live analytics:
-```bash
-tokenpinch status
-```
+Open `TokenPinch.dmg`, drag TokenPinch into Applications, and open it. The first open asks for the licence key in Terminal. That same open starts the menu bar, and the menu bar starts the gateway. After that, `tokenpinch shrink yourfile.py`.
 
 ---
 
 ## 🔒 Security & Code Integrity
 
-TokenPinch is built with absolute security in mind. The core engine is fully compiled to native machine assembly using **Cython** (for Mac/Linux) and optimized compilation tools for other platforms so your intellectual property remains private and secure from code-copying or standard byte-decompilation.
+Files are processed on this Mac. The only network call is the licence check.
 
 ---
 

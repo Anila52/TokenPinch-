@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "TokenPinch",
+  "version": "1.2.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4X+5DPze1H70A8NIcTGvCEytvVSVlWg/OqJDOrkz5QMZx6GKG9KxwrRWiUnelz6KU/CA9YRUSXrAoLKv84O3oWDt634jYYu8PVfJsGPVdNT3VRibjWOzTWSuogfOxl6JGdoNOH5mSIsR90JLMrpU2ViSc0n5bf4BN/CCBGcYSlLSMG3JRAPr24WfGuUAws30xAnIjNEdGbVfa4pNpLxE0rmcvRDOpjK1ZU0lqmpeIW1s0yzqqwCF/yPPAZQjTzwDTQAthXv51whulub8nBkXfFI+fwjwY9af+SHwczuvqkwiX+rK8NXefZYFMkHLm24KexRpCLbpExF2OYgTsDKuxwIDAQAB",
+  "description": "Compress the current chat draft locally before it is sent.",
+  "permissions": ["nativeMessaging", "storage", "scripting"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*"
+  ],
+  "optional_host_permissions": ["https://*/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html" },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*", "https://claude.ai/*", "https://gemini.google.com/*"],
+      "js": ["policy.js", "adapters.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

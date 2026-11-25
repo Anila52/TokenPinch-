@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3" "/Users/Tariq/Desktop/TokenPinch_Product_Files/browser/host/host.py"

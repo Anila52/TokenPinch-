@@ -1,0 +1,13 @@
+description: TokenPinch slice still answers. Shrink is scored offline in tests/test_pinch.py.
+providers:
+  - id: openai:gpt-4.1-mini
+    config:
+      temperature: 0
+prompts:
+  - file://prompts/question_full.txt
+  - file://prompts/question_pinched.txt
+tests:
+  - description: target(1) is 4 when the body is still there
+    assert:
+      - type: icontains
+        value: "4"

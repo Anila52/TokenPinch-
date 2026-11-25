@@ -1,0 +1,7 @@
+What does target(1) return? Reply with the number only.
+
+def helper(x):
+    return x + 1
+
+def target(n):
+    return helper(n) * 2

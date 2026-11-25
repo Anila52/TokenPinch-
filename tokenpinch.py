@@ -5,6 +5,8 @@ import re
 import ast
 import json
 import csv
+import socket
+import stat
 import subprocess
 import webbrowser
 import sqlite3
@@ -21,6 +23,22 @@ CSV_PATH = os.path.join(INSTALL_DIR, "spend_audit.csv")
 HTML_PATH = os.path.join(INSTALL_DIR, "dashboard.html")
 
 os.makedirs(INSTALL_DIR, exist_ok=True)
+
+def menu_bar_icon_path():
+    name = "MenuBarIconTemplate.png"
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(meipass)
+    if getattr(sys, "frozen", False):
+        roots.append(os.path.normpath(os.path.join(os.path.dirname(sys.executable), "..", "Resources")))
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    roots.append(INSTALL_DIR)
+    for root in roots:
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            return path
+    return None
 
 CACHE_DB_PATH = os.path.join(INSTALL_DIR, "tokenpinch_cache.db")
 
@@ -167,49 +185,40 @@ def calculate_tfidf_similarity(prompt1, prompt2_list):
         results.append((idx, similarity))
     return results
 
+def canonical_prompt(text):
+    text = str(text).replace("\r\n", "\n")
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\b", "", text)
+    text = re.sub(r"\b(?:request[_ ]?id|trace[_ ]?id)\s*[:=]\s*\S+", "", text, flags=re.I)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 def lookup_prompt_cache(prompt_text):
+    """Exact cache only. A near match is a different answer."""
     try:
-        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        prompt_hash = hashlib.sha256(canonical_prompt(prompt_text).encode("utf-8")).hexdigest()
         conn = sqlite3.connect(CACHE_DB_PATH, timeout=5)
         cursor = conn.cursor()
         cursor.execute("SELECT response_json, is_stream FROM prompt_cache WHERE prompt_hash = ?", (prompt_hash,))
         row = cursor.fetchone()
-        if row:
-            conn.close()
-            return json.loads(row[0]), bool(row[1]), "Exact Cache Hit"
-            
-        words = normalize_and_tokenize(prompt_text)
-        if len(words) >= 5:
-            cursor.execute("SELECT prompt_hash, normalized_words, original_prompt, response_json, is_stream FROM prompt_cache")
-            rows = cursor.fetchall()
-            
-            # 1. Try Jaccard (very fast)
-            for r_hash, r_norm, r_orig, r_json, r_stream in rows:
-                if not r_norm: continue
-                cached_words = set(r_norm.split(","))
-                sim = fuzzy_match_similarity(words, cached_words)
-                if sim >= 0.92:
-                    conn.close()
-                    return json.loads(r_json), bool(r_stream), f"Fuzzy Cache Hit ({sim*100:.1f}%)"
-                    
-            # 2. Try Advanced Semantic TF-IDF Cosine Similarity
-            if rows:
-                candidate_prompts = [r[2] for r in rows if r[2]]
-                if candidate_prompts:
-                    sim_scores = calculate_tfidf_similarity(prompt_text, candidate_prompts)
-                    best_idx, best_score = max(sim_scores, key=lambda x: x[1]) if sim_scores else (-1, 0.0)
-                    if best_score >= 0.85:
-                        r_hash, r_norm, r_orig, r_json, r_stream = rows[best_idx]
-                        conn.close()
-                        return json.loads(r_json), bool(r_stream), f"Semantic TF-IDF Cache Hit ({best_score*100:.1f}%)"
         conn.close()
+        if row:
+            return json.loads(row[0]), bool(row[1]), "Exact Cache Hit"
     except Exception:
         pass
     return None
 
+CACHE_FALSE_HITS = 0
+
+def note_cache_hit(kind):
+    global CACHE_FALSE_HITS
+    if not str(kind).startswith("Exact"):
+        CACHE_FALSE_HITS += 1
+    return CACHE_FALSE_HITS
+
 def save_prompt_cache(prompt_text, response_json, is_stream):
     try:
-        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        prompt_hash = hashlib.sha256(canonical_prompt(prompt_text).encode("utf-8")).hexdigest()
         words = normalize_and_tokenize(prompt_text)
         normalized_words_str = ",".join(sorted(list(words)))
         conn = sqlite3.connect(CACHE_DB_PATH, timeout=5)
@@ -275,6 +284,23 @@ def ast_recursive_slice(content, target_name):
                 end = getattr(node, 'end_lineno', node.lineno)
                 for tname in target_names:
                     defs[tname] = (node, start, end, deps)
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            deps = set()
+            for child in ast.walk(item):
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id not in ("self", "cls"):
+                    deps.add(child.id)
+            start = item.lineno - 1
+            if item.decorator_list:
+                start = min(item.decorator_list[0].lineno - 1, start)
+            end = getattr(item, "end_lineno", item.lineno)
+            defs[f"{node.name}.{item.name}"] = (item, start, end, deps)
+            if item.name not in defs:
+                defs[item.name] = (item, start, end, deps)
     if target_name not in defs:
         return ""
     required_defs = set()
@@ -307,9 +333,127 @@ def ast_recursive_slice(content, target_name):
         node_id = id(node)
         if node_id not in seen_nodes:
             seen_nodes.add(node_id)
-            pieces.append(("\n".join(lines[start:end]), start))
+            text = "\n".join(lines[start:end])
+            if name != target_name:
+                text = _py_signature(node, lines, start, end)
+            pieces.append((text, start))
     pieces.sort(key=lambda x: x[1])
-    return "\n\n".join(p[0] for p in pieces)
+    return "\n\n".join(_dedent_block(p[0]) for p in pieces)
+
+def _py_signature(node, lines, start, end):
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not node.body:
+        return "\n".join(lines[start:end])
+    body_start = node.body[0].lineno - 1
+    header = "\n".join(lines[start:body_start]).rstrip()
+    indent = len(lines[body_start]) - len(lines[body_start].lstrip(" "))
+    return header + "\n" + (" " * indent) + "..."
+
+def _dedent_block(text):
+    lines = text.splitlines()
+    indents = [len(line) - len(line.lstrip(" ")) for line in lines if line.strip()]
+    if not indents:
+        return text
+    cut = min(indents)
+    if cut == 0:
+        return text
+    return "\n".join(line[cut:] if line.startswith(" " * cut) else line for line in lines)
+
+_TS_DECL_RE = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s+([A-Za-z_$][\w$]*)|class\s+([A-Za-z_$][\w$]*)|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=)")
+_TS_METH_RE = re.compile(r"^(?:public\s+|private\s+|protected\s+)?(?:async\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\([^;]*\)\s*(?::\s*[^{]+)?\s*\{?\s*$")
+_TS_SKIP = {"if", "for", "while", "switch", "catch", "function", "return", "else"}
+
+def _ts_signature(lines, start):
+    line = lines[start].rstrip()
+    if "{" in line:
+        return line[:line.index("{")].rstrip() + " { ... }"
+    return line + " { ... }"
+
+def _ts_brace_end(lines, start):
+    depth = 0
+    seen = False
+    for i in range(start, len(lines)):
+        for ch in lines[i]:
+            if ch == "{":
+                depth += 1
+                seen = True
+            elif ch == "}":
+                depth -= 1
+                if seen and depth == 0:
+                    return i + 1
+    return None
+
+def ts_recursive_slice(content, target_name):
+    lines = content.splitlines()
+    decls = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        name = None
+        kind = None
+        m = _TS_DECL_RE.match(stripped)
+        if m:
+            name = m.group(1) or m.group(2) or m.group(3)
+            kind = "class" if m.group(2) else "fn"
+        else:
+            mm = _TS_METH_RE.match(stripped)
+            if mm and mm.group(1) not in _TS_SKIP:
+                name = mm.group(1)
+                kind = "fn"
+        if not name:
+            continue
+        end = _ts_brace_end(lines, i)
+        if end is None:
+            continue
+        decls.append((name, i, end, kind))
+    by_name = {}
+    for name, start, end, kind in decls:
+        if name not in by_name:
+            by_name[name] = (start, end)
+    classes = [(n, s, e) for n, s, e, k in decls if k == "class"]
+    for name, start, end, kind in decls:
+        if kind != "fn":
+            continue
+        for cn, cs, ce in classes:
+            if cs < start < ce:
+                q = f"{cn}.{name}"
+                if q not in by_name:
+                    by_name[q] = (start, end)
+                break
+    if target_name not in by_name:
+        return ""
+    needed = {target_name}
+    changed = True
+    while changed:
+        changed = False
+        for key in list(needed):
+            s, e = by_name[key]
+            text = "\n".join(lines[s:e])
+            for other, (os_, oe) in by_name.items():
+                if other in needed or (os_, oe) == (s, e):
+                    continue
+                bare = other.split(".")[-1]
+                if re.search(rf"\b{re.escape(bare)}\b", text):
+                    needed.add(other)
+                    changed = True
+    spans = []
+    for key in needed:
+        spans.append(by_name[key])
+    spans.sort()
+    kept = []
+    for s, e in spans:
+        if any(ps <= s and e <= pe and (ps, pe) != (s, e) for ps, pe in spans):
+            continue
+        kept.append((s, e))
+    pieces = []
+    used = {k.split(".")[-1] for k in needed}
+    for i, line in enumerate(lines):
+        if line.strip().startswith("import ") and any(re.search(rf"\b{re.escape(b)}\b", line) for b in used):
+            pieces.append((i, line))
+    target_span = by_name[target_name]
+    for s, e in kept:
+        block = "\n".join(lines[s:e]) if (s, e) == target_span else _ts_signature(lines, s)
+        pieces.append((s, block))
+    pieces.sort()
+    return "\n\n".join(p[1] for p in pieces)
 
 def auto_slice_prompt(messages, max_budget):
     full_text = ""
@@ -335,7 +479,7 @@ def auto_slice_prompt(messages, max_budget):
     blocks = []
     code_block_pat = r"```([a-zA-Z0-9+#_.-]*)\n([\s\S]*?)```"
     for m_idx, msg in enumerate(messages):
-        if not isinstance(msg, dict) or "content" not in msg:
+        if not isinstance(msg, dict) or "content" not in msg or msg.get("role") == "system":
             continue
         content = msg["content"]
         if isinstance(content, str):
@@ -553,9 +697,9 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-GUMROAD_PRODUCT_ID = "PASTE_YOUR_GUMROAD_PRODUCT_ID_HERE"
+GUMROAD_PRODUCT_ID = "cyroew"
 GUMROAD_VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
-SUPPORT_EMAIL = "PASTE_YOUR_SUPPORT_EMAIL_HERE"
+SUPPORT_EMAIL = "contact@clausetenconsulting.com"
 LICENSE_FILE = os.path.join(INSTALL_DIR, "license.json")
 RECHECK_DAYS = 30          # quietly re-check with Gumroad this often (when online)
 OFFLINE_GRACE_DAYS = 90    # keep working offline this long without a re-check
@@ -633,6 +777,7 @@ def activate_interactively():
     print("==================================================")
     print("Paste the licence key from your Gumroad receipt.")
     print("Activation needs the internet once; after that TokenPinch works offline.")
+    print(f"Privacy: we store the key and a one-way code of this Mac. Source code stays here. {SUPPORT_EMAIL}")
     print("==================================================")
     try:
         if not sys.stdin.isatty():
@@ -661,9 +806,8 @@ def activate_interactively():
         sys.exit(1)
     limit = device_limit_for(purchase)
     if int(check.get("uses", 0)) >= limit:
-        plural = "device" if limit == 1 else "devices"
-        print(f"\n❌ This licence is already active on {limit} {plural}, the most your plan allows.")
-        print(f"To move it to this Mac, email {SUPPORT_EMAIL} with your order number.")
+        print("\n❌ This licence is already active on all its devices — email support to move it.")
+        print(SUPPORT_EMAIL)
         sys.exit(1)
 
     try:
@@ -755,7 +899,7 @@ def log_audit(tool, target, in_tokens, out_tokens, cost, status="Success", count
     except Exception:
         pass
 
-def print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, tool_name, extra_desc="", scrub_summary=""):
+def print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, tool_name, extra_desc="", scrub_summary="", bodies_kept=None):
     """Logs and prints a detailed and visual Token Savings Summary with Runway Meter."""
     saved_tokens = max(0, orig_tokens - new_tokens)
     percent_saved = (saved_tokens / orig_tokens * 100) if orig_tokens > 0 else 0.0
@@ -776,6 +920,8 @@ def print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, tool_
     print(f"  - New Tokens:      {new_tokens}")
     print(f"  - Tokens Saved:    {saved_tokens} ({percent_saved:.1f}%)")
     print(f"  - Estimated Saved: ${savings_usd:.4f}")
+    if bodies_kept is not None:
+        print(f"  - Answer held:     {'yes' if bodies_kept else 'no'}")
     
     # Visual LLM Runway Meter
     if orig_tokens > 0 and percent_saved > 0:
@@ -939,6 +1085,78 @@ def count_tokens(text, exact=False):
     except Exception:
         # Final fallback if tiktoken isn't available
         return int(len(text.split()) * 1.33), "estimate-fallback"
+
+def _py_bodies(src):
+    tree = ast.parse(src)
+    found = {}
+    def walk(body, prefix=""):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                key = f"{prefix}{node.name}" if prefix else node.name
+                found[key] = tuple(ast.dump(stmt) for stmt in node.body)
+            elif isinstance(node, ast.ClassDef):
+                found[node.name] = tuple(ast.dump(stmt) for stmt in node.body)
+                walk(node.body, prefix=f"{node.name}.")
+    walk(tree.body)
+    return found
+
+def bodies_kept(original, pinched):
+    if not pinched or not str(pinched).strip():
+        return False
+    try:
+        orig = _py_bodies(original)
+        new = _py_bodies(pinched)
+    except SyntaxError:
+        if re.search(r"\{\s*\.\.\.\s*\}", pinched) or re.search(r"(?m)^\s*\.\.\.\s*$", pinched):
+            return False
+        return True
+    if not new:
+        return False
+    for name, body in new.items():
+        if name in orig and orig[name] != body:
+            return False
+    return True
+
+def pinch_scores(original, pinched):
+    before, counter = count_tokens(original)
+    after, _ = count_tokens(pinched)
+    return {"tokens_before": before, "tokens_after": after, "counter": counter, "bodies_kept": bodies_kept(original, pinched)}
+
+_FENCE_RE = re.compile(r"```[\s\S]*?```")
+_INSTRUCTION_RE = re.compile(r"(?i)^\s*(?:do not|don't|never|always|must|you are|instruction)\b")
+
+def _compress_prose(chunk):
+    lines = []
+    for line in chunk.split("\n"):
+        if line.startswith(">") or _INSTRUCTION_RE.match(line):
+            lines.append(line)
+            continue
+        parts = re.split(r"(`[^`\n]*`|\"[^\"\n]*\"|'[^'\n]*')", line)
+        built = []
+        for i, part in enumerate(parts):
+            built.append(part if i % 2 else re.sub(r"[ \t]{2,}", " ", part).rstrip())
+        lines.append("".join(built))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+
+def compress_draft(text):
+    """Compress one outgoing draft. Does not touch the clipboard, licence prompt, or gateway."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    pieces = []
+    last = 0
+    for match in _FENCE_RE.finditer(text):
+        pieces.append(_compress_prose(text[last:match.start()]))
+        pieces.append(match.group(0))
+        last = match.end()
+    pieces.append(_compress_prose(text[last:]))
+    result = "".join(pieces)
+    before, counter = count_tokens(text)
+    after, _ = count_tokens(result)
+    return {"text": result, "tokens_before": before, "tokens_after": after, "counter": counter, "changed": result != text}
+
+def browser_licence_ok():
+    lic = _load_license()
+    return bool(lic and lic.get("key") and lic.get("device") == device_fingerprint())
 
 def scrub_text(text, active=True):
     """Detects and redacts secrets, passwords, keys, IPs, and emails."""
@@ -1237,18 +1455,9 @@ def squeeze_with_budget(filepath, budget=None, exact=False):
 
 # ==================== SUBCOMMANDS ====================
 
-def run_shrink(filepath, exact=False, scrub=True):
-    """Squeezes code file layout, stripping bodies and comments."""
-    if not os.path.exists(filepath):
-        print(f"Error: File '{filepath}' not found.")
-        sys.exit(1)
-        
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-        content = f.read()
-        
-    _, ext = os.path.splitext(filepath.lower())
+def shrink_source(content, ext):
+    """Drop comments and function bodies. The token cut is real. The answer is not."""
     shrunk = []
-    
     if ext == '.py':
         in_multiline = False
         for line in content.splitlines():
@@ -1297,9 +1506,18 @@ def run_shrink(filepath, exact=False, scrub=True):
                     shrunk.append(line)
     else:
         shrunk = content.splitlines()[:50] + ["... [truncated] ..."]
-        
-    result = "\n".join(shrunk)
-    
+    return "\n".join(shrunk)
+
+def run_shrink(filepath, exact=False, scrub=True):
+    """Squeezes code file layout, stripping bodies and comments."""
+    if not os.path.exists(filepath):
+        print(f"Error: File '{filepath}' not found.")
+        sys.exit(1)
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    _, ext = os.path.splitext(filepath.lower())
+    result = shrink_source(content, ext)
+
     # 1. Secret scrubbing
     scrubbed_result, scrub_summary = scrub_text(result, active=scrub)
     
@@ -1320,7 +1538,7 @@ def run_shrink(filepath, exact=False, scrub=True):
     
     # Print outputs
     print("Copied shrunk skeleton to clipboard!")
-    print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, "Shrink", scrub_summary=scrub_summary)
+    print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, "Shrink", scrub_summary=scrub_summary, bodies_kept=bodies_kept(content, scrubbed_result))
 
 
 def run_slice(filepath, target_name, exact=False, scrub=True):
@@ -1342,6 +1560,8 @@ def run_slice(filepath, target_name, exact=False, scrub=True):
             sliced_code = ast_recursive_slice(content, target_name)
         except Exception:
             pass
+    elif ext in ('.ts', '.tsx', '.js', '.jsx'):
+        sliced_code = ts_recursive_slice(content, target_name)
 
     if not sliced_code:
         # Fallback to text parsing
@@ -1387,7 +1607,7 @@ def run_slice(filepath, target_name, exact=False, scrub=True):
     
     # Print outputs
     print(f"Copied code slice of '{target_name}' from '{os.path.basename(filepath)}' to clipboard!")
-    print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, "Slice", extra_desc=f"{os.path.basename(filepath)}:{target_name}", scrub_summary=scrub_summary)
+    print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, "Slice", extra_desc=f"{os.path.basename(filepath)}:{target_name}", scrub_summary=scrub_summary, bodies_kept=bodies_kept(content, scrubbed_code))
 
 
 def run_squeeze(filepath, budget=None, exact=False, scrub=True):
@@ -1487,7 +1707,7 @@ Answer in extremely short, active-voice bullet points. No prose."""
     print("Copied squeezed REA prompt to clipboard!")
     if dropped_funcs:
         print(f"⚠️ Dropped functions due to budget limit ({budget} tokens): {', '.join(dropped_funcs)}")
-    print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, "Squeeze", scrub_summary=scrub_summary)
+    print_savings_summary(orig_tokens, new_tokens, counter_used, filepath, "Squeeze", scrub_summary=scrub_summary, bodies_kept=bodies_kept(combined_original_content, result_code))
 
 
 def run_auto_heal(command, exact=False, scrub=True):
@@ -2008,123 +2228,281 @@ def optimize_text_content(text, scrub=True):
         if "FUN_" in code or "in_GS_OFFSET" in code or "__stack_chk_fail" in code or "undefined" in code:
             squeezed = apply_squeeze_filters(code)
             return f"```{lang}\n{squeezed}\n```"
-        # Check for python inline imports
-        if lang in ["py", "python"]:
-            squeezed = resolve_and_squeeze_imports(code, lang)
-            return f"```{lang}\n{squeezed}\n```"
         return match.group(0)
     
     text = re.sub(r"```([a-zA-Z0-9+#_.-]*)\n([\s\S]*?)```", squeeze_block, text)
     
     return text, scrub_summary
 
-def optimize_payload(path, body_bytes, scrub_active=True):
-    """Parses JSON API payload and optimizes prompts inside user messages."""
+IMAGE_TOKENS = 765
+
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text")
+    return ""
+
+def _image_count(content):
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for item in content if isinstance(item, dict) and item.get("type") in ("image_url", "image"))
+
+def payload_bill(data):
+    system = code = prose = tool_tokens = images = 0
+    anth = data.get("system")
+    if isinstance(anth, str):
+        system += count_tokens(anth)[0]
+    elif isinstance(anth, list):
+        for item in anth:
+            if isinstance(item, dict) and item.get("type") == "text":
+                system += count_tokens(item.get("text", ""))[0]
+    for tool in data.get("tools") or []:
+        tool_tokens += count_tokens(json.dumps(tool, separators=(",", ":")))[0]
+    for msg in data.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        images += _image_count(msg.get("content"))
+        text = _text_of(msg.get("content"))
+        if not text:
+            continue
+        if msg.get("role") == "system":
+            system += count_tokens(text)[0]
+            continue
+        blocks = re.findall(r"```[a-zA-Z0-9+#_.-]*\n([\s\S]*?)```", text)
+        prose += count_tokens(re.sub(r"```[\s\S]*?```", "", text))[0]
+        for block in blocks:
+            code += count_tokens(block)[0]
+    return {
+        "tokens": system + code + prose + tool_tokens + images * IMAGE_TOKENS,
+        "system": system, "code": code, "prose": prose,
+        "tools": tool_tokens, "images": images, "image_tokens": images * IMAGE_TOKENS,
+    }
+
+def cap_completion(data):
+    ceiling = int(load_prices().get("max_output_tokens", 1024))
+    key = "max_completion_tokens" if "max_completion_tokens" in data and "max_tokens" not in data else "max_tokens"
+    before = data.get(key)
+    if before is None:
+        data["max_tokens"] = ceiling
+        return None, ceiling
+    if isinstance(before, int) and before > ceiling:
+        data[key] = ceiling
+        return before, ceiling
+    return before, before
+
+def read_usage(response_text):
+    if not response_text:
+        return None
+    try:
+        data = json.loads(response_text)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        usage = data.get("usage") or {}
+        prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+        completion = usage.get("completion_tokens", usage.get("output_tokens"))
+        if prompt is not None or completion is not None:
+            return {"prompt_tokens": int(prompt or 0), "completion_tokens": int(completion or 0)}
+    prompt = completion = None
+    for line in str(response_text).splitlines():
+        if not line.startswith("data:") or line.strip() == "data: [DONE]":
+            continue
+        try:
+            chunk = json.loads(line[5:].strip())
+        except Exception:
+            continue
+        usage = chunk.get("usage") or {}
+        if any(k in usage for k in ("prompt_tokens", "input_tokens", "completion_tokens", "output_tokens")):
+            prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+            completion = usage.get("completion_tokens", usage.get("output_tokens"))
+    if prompt is None and completion is None:
+        return None
+    return {"prompt_tokens": int(prompt or 0), "completion_tokens": int(completion or 0)}
+
+def bill_from_usage(usage):
+    prices = load_prices()
+    return usage["prompt_tokens"] * prices.get("input_price_per_million", 3.0) / 1000000.0 + usage["completion_tokens"] * prices.get("output_price_per_million", 15.0) / 1000000.0
+
+def failover_decision(status_code, attempt):
+    if status_code == 429 and attempt == 0:
+        return "retry"
+    if status_code in (500, 502, 503, 504):
+        return "failover"
+    return "forward_error"
+
+def _tool_name(tool):
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function") or {}
+    return fn.get("name") or tool.get("name") or ""
+
+def select_tools(data):
+    tools = data.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return
+    blob = ""
+    for msg in reversed(data.get("messages") or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            blob = _text_of(msg.get("content"))
+            break
+    named = [t for t in tools if _tool_name(t) and re.search(rf"\b{re.escape(_tool_name(t))}\b", blob)]
+    if named:
+        data["tools"] = named
+
+def _tool_path(arguments):
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except Exception:
+            m = re.search(r'"(?:path|file_path|file)"\s*:\s*"([^"]+)"', arguments)
+            return m.group(1) if m else ""
+    if isinstance(arguments, dict):
+        return str(arguments.get("path") or arguments.get("file_path") or arguments.get("file") or "")
+    return ""
+
+def dedupe_tool_results(messages):
+    id_key = {}
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        for call in msg.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function") or {}
+            path = _tool_path(fn.get("arguments"))
+            if path:
+                id_key[call.get("id")] = (fn.get("name") or "", path)
+    def key_for(msg):
+        key = id_key.get(msg.get("tool_call_id"))
+        if key and key[1]:
+            return key
+        m = re.search(r"(?:path|file_path)\s*[:=]\s*(\S+)", str(msg.get("content") or ""))
+        if m:
+            return ("", m.group(1))
+        return None
+    last = {}
+    for i, msg in enumerate(messages):
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            key = key_for(msg)
+            if key:
+                last[key] = i
+    drop = {i for i, msg in enumerate(messages) if isinstance(msg, dict) and msg.get("role") == "tool" and key_for(msg) and last.get(key_for(msg)) != i}
+    if not drop:
+        return messages
+    return [m for i, m in enumerate(messages) if i not in drop]
+
+def drop_redundant_images(messages):
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") == "system":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        blob = _text_of(content)
+        if "Traceback" in blob or re.search(r"(?m)^Error:", blob):
+            msg["content"] = [item for item in content if not (isinstance(item, dict) and item.get("type") in ("image_url", "image", "document"))]
+    return messages
+
+def _asked_names(messages):
+    found = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            prose = re.sub(r"```[\s\S]*?```", " ", _text_of(msg.get("content")))
+            found.extend(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", prose))
+    return found
+
+def pinch_named_code(text, asked):
+    if not text or not asked:
+        return text
+    def repl(match):
+        lang = (match.group(1) or "").lower()
+        code = match.group(2)
+        sliced = ""
+        if lang in ("py", "python"):
+            defs = re.findall(r"(?m)^\s*(?:async\s+)?def\s+([A-Za-z_][\w]*)\b", code)
+            hits = [n for n in asked if n in defs]
+            if hits:
+                sliced = ast_recursive_slice(code, hits[-1])
+        elif lang in ("ts", "tsx", "js", "jsx", "javascript", "typescript"):
+            defs = re.findall(r"(?:function|class)\s+([A-Za-z_$][\w$]*)", code)
+            hits = [n for n in asked if n in defs]
+            if hits:
+                sliced = ts_recursive_slice(code, hits[-1])
+        if not sliced:
+            return match.group(0)
+        return f"```{lang}\n{sliced}\n```"
+    return re.sub(r"```([a-zA-Z0-9+#_.-]*)\n([\s\S]*?)```", repl, text)
+
+def _pinch_content(content, asked, scrub):
+    if isinstance(content, str):
+        optimized, summary = optimize_text_content(pinch_named_code(content, asked), scrub=scrub)
+        return optimized, summary
+    if isinstance(content, list):
+        summaries = []
+        new_list = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                optimized, summary = optimize_text_content(pinch_named_code(item.get("text", ""), asked), scrub=scrub)
+                if summary:
+                    summaries.append(summary)
+                item = dict(item)
+                item["text"] = optimized
+            new_list.append(item)
+        return new_list, "; ".join(summaries)
+    return content, ""
+
+def sent_prompt_text(body_bytes):
     try:
         data = json.loads(body_bytes.decode("utf-8"))
     except Exception:
-        return body_bytes, 0, 0, "Unknown", "Unknown", ""
-        
+        return ""
+    parts = []
+    system = data.get("system")
+    if isinstance(system, str):
+        parts.append(system)
+    elif isinstance(system, list):
+        for item in system:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+    for msg in data.get("messages") or []:
+        if isinstance(msg, dict):
+            parts.append(_text_of(msg.get("content")))
+    names = [_tool_name(t) for t in (data.get("tools") or [])]
+    if any(names):
+        parts.append(" ".join(n for n in names if n))
+    return "\n".join(p for p in parts if p)
+
+def optimize_payload(path, body_bytes, scrub_active=True):
+    """Pinch a live API body. System text stays byte for byte."""
+    try:
+        data = json.loads(body_bytes.decode("utf-8"))
+    except Exception:
+        return body_bytes, 0, 0, "Unknown", "Unknown", "", 0, 0, 0
     model_name = data.get("model", "Unknown")
     messages = data.get("messages", [])
-    
     if not isinstance(messages, list):
-        return body_bytes, 0, 0, model_name, "Unknown", ""
-        
-    # Apply sliding-window budgeting / auto-slicing
-    prices = load_prices()
-    max_budget = prices.get("max_context_budget", 15000)
-    messages, sliced_any = auto_slice_prompt(messages, max_budget)
-    if sliced_any:
-        data["messages"] = messages
-        
-    original_text_parts = []
-    total_scrub_summary = []
-    
-    def process_content_item(content_item):
-        if isinstance(content_item, str):
-            original_text_parts.append(content_item)
-            optimized, summary = optimize_text_content(content_item, scrub=scrub_active)
-            if summary:
-                total_scrub_summary.append(summary)
-            return optimized
-        elif isinstance(content_item, list):
-            new_list = []
-            for item in content_item:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_val = item.get("text", "")
-                    original_text_parts.append(text_val)
-                    optimized, summary = optimize_text_content(text_val, scrub=scrub_active)
-                    if summary:
-                        total_scrub_summary.append(summary)
-                    new_item = dict(item)
-                    new_item["text"] = optimized
-                    new_list.append(new_item)
-                else:
-                    new_list.append(item)
-            return new_list
-        return content_item
-
+        return body_bytes, 0, 0, model_name, "Unknown", "", 0, 0, 0
+    before = payload_bill(data)
+    cap_completion(data)
+    messages = dedupe_tool_results(messages)
+    data["messages"] = messages
+    select_tools(data)
+    messages, _sliced = auto_slice_prompt(messages, load_prices().get("max_context_budget", 15000))
+    data["messages"] = messages
+    asked = _asked_names(messages)
+    summaries = []
     for msg in messages:
-        if isinstance(msg, dict) and "content" in msg:
-            msg["content"] = process_content_item(msg["content"])
-            
-    modified_body_bytes = json.dumps(data).encode("utf-8")
-    
-    orig_tokens = 0
-    new_tokens = 0
-    counter_used = "tiktoken"
-    system_tokens = 0
-    code_tokens = 0
-    prose_tokens = 0
-    
-    if original_text_parts:
-        full_original_text = "\n".join(original_text_parts)
-        optimized_text_parts = []
-        for msg in messages:
-            if isinstance(msg, dict) and "content" in msg:
-                content = msg["content"]
-                if isinstance(content, str):
-                    optimized_text_parts.append(content)
-                elif isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            optimized_text_parts.append(item.get("text", ""))
-        full_optimized_text = "\n".join(optimized_text_parts)
-        
-        orig_tokens, counter_used = count_tokens(full_original_text)
-        new_tokens, _ = count_tokens(full_optimized_text)
-        
-        for msg in messages:
-            if not isinstance(msg, dict): continue
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                if isinstance(content, str):
-                    toks, _ = count_tokens(content)
-                    system_tokens += toks
-                elif isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            toks, _ = count_tokens(item.get("text", ""))
-                            system_tokens += toks
-            else:
-                text_val = ""
-                if isinstance(content, str):
-                    text_val = content
-                elif isinstance(content, list):
-                    text_val = "\n".join(item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text")
-                if text_val:
-                    code_blocks = re.findall(r"```[a-zA-Z0-9+#_.-]*\n([\s\S]*?)```", text_val)
-                    prose = re.sub(r"```[\s\S]*?```", "", text_val)
-                    prose_toks, _ = count_tokens(prose)
-                    prose_tokens += prose_toks
-                    for cb in code_blocks:
-                        cb_toks, _ = count_tokens(cb)
-                        code_tokens += cb_toks
-        
-    scrub_summary = "; ".join(total_scrub_summary) if total_scrub_summary else ""
-    return modified_body_bytes, orig_tokens, new_tokens, model_name, counter_used, scrub_summary, system_tokens, code_tokens, prose_tokens
+        if not isinstance(msg, dict) or "content" not in msg or msg.get("role") == "system":
+            continue
+        new_content, summary = _pinch_content(msg["content"], asked, scrub_active)
+        msg["content"] = new_content
+        if summary:
+            summaries.append(summary)
+    drop_redundant_images(messages)
+    after = payload_bill(data)
+    modified = json.dumps(data).encode("utf-8")
+    return modified, before["tokens"], after["tokens"], model_name, "tiktoken", "; ".join(summaries), after["system"], after["code"], after["prose"]
 
 def failover_openai_to_anthropic(req_bytes, is_stream_req, orig_model):
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -2280,20 +2658,13 @@ def start_gateway_server(host, port, scrub=True):
                     req_data = json.loads(body_bytes.decode("utf-8"))
                     model_name = req_data.get("model", "Unknown")
                     is_stream_req = req_data.get("stream", False)
-                    prompt_parts = []
-                    for m in req_data.get("messages", []):
-                        if isinstance(m, dict) and "content" in m:
-                            cnt = m["content"]
-                            if isinstance(cnt, str):
-                                prompt_parts.append(cnt)
-                            elif isinstance(cnt, list):
-                                for item in cnt:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        prompt_parts.append(item.get("text", ""))
-                    prompt_text = "\n".join(prompt_parts)
                 except Exception:
                     pass
-            
+                modified_bytes, orig_tokens, new_tokens, model_name, counter_used, scrub_summary, system_tokens, code_tokens, prose_tokens = optimize_payload(
+                    self.path, body_bytes, scrub_active=scrub
+                )
+                prompt_text = sent_prompt_text(modified_bytes)
+
             if is_interceptable and prompt_text:
                 cached_res = lookup_prompt_cache(prompt_text)
                 if cached_res:
@@ -2303,6 +2674,7 @@ def start_gateway_server(host, port, scrub=True):
                     input_price = load_prices().get("input_price_per_million", 3.0) / 1000000.0
                     savings_usd = orig_tok * input_price
                     
+                    note_cache_hit(hit_type)
                     log_audit("CacheHit", model_name, orig_tok, 0, savings_usd, f"Saved ${savings_usd:.5f} (100% Free)", "cache")
                     
                     print(f"[{timestamp}] 🧠 \033[1;35m{hit_type}\033[0m for \033[1;36m{model_name}\033[0m:")
@@ -2326,14 +2698,6 @@ def start_gateway_server(host, port, scrub=True):
                         self.wfile.write(response_str.encode("utf-8"))
                     return
 
-            system_tokens = 0
-            code_tokens = 0
-            prose_tokens = 0
-            if is_interceptable and len(body_bytes) > 0:
-                modified_bytes, orig_tokens, new_tokens, model_name, counter_used, scrub_summary, system_tokens, code_tokens, prose_tokens = optimize_payload(
-                    self.path, body_bytes, scrub_active=scrub
-                )
-                
             forward_headers = {}
             for key, val in self.headers.items():
                 if key.lower() not in ["host", "content-length", "accept-encoding", "connection"]:
@@ -2361,6 +2725,9 @@ def start_gateway_server(host, port, scrub=True):
                 print(f"  - Optimized Tokens: {new_tokens:,}")
                 print(f"  - Tokens Saved:    \033[32m{saved_tokens:,} ({percent_saved:.1f}%)\033[0m")
                 print(f"  - Estimated Saved: \033[1;32m${savings_usd:.5f}\033[0m")
+                print(f"  - System tokens:   {system_tokens:,}")
+                print(f"  - Code tokens:     {code_tokens:,}")
+                print(f"  - Prose tokens:    {prose_tokens:,}")
                 if scrub_summary:
                     print(f"  - Security Action: \033[1;33m{scrub_summary}\033[0m")
                 print("-" * 50)
@@ -2386,11 +2753,47 @@ def start_gateway_server(host, port, scrub=True):
                         try:
                             response_str = captured_response_bytes.decode("utf-8", errors="ignore")
                             save_prompt_cache(prompt_text, response_str, is_stream_req)
+                            usage = read_usage(response_str)
+                            if usage:
+                                print(f"  - Provider prompt: {usage['prompt_tokens']:,}")
+                                print(f"  - Provider reply:  {usage['completion_tokens']:,}")
+                                print(f"  - Provider bill:   ${bill_from_usage(usage):.5f}")
                         except Exception:
                             pass
             except urllib.error.HTTPError as e:
-                # Trigger failover routing on rate limits (429) or server outages (5xx)
-                if e.code in [429, 500, 502, 503, 504] and is_interceptable and self.path.startswith("/v1/chat/completions"):
+                decision = failover_decision(e.code, 0)
+                if decision == "retry":
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[{timestamp}] Upstream {e.code}. Retrying the same provider once.")
+                    try:
+                        retry_req = urllib.request.Request(
+                            upstream_url,
+                            data=modified_bytes if len(modified_bytes) > 0 else None,
+                            headers=forward_headers,
+                            method="POST"
+                        )
+                        with urllib.request.urlopen(retry_req, timeout=60, context=_ssl_context()) as resp:
+                            self.send_response(resp.status)
+                            for header, val in resp.getheaders():
+                                if header.lower() not in ["content-length", "connection"]:
+                                    self.send_header(header, val)
+                            self.end_headers()
+                            captured_response_bytes = bytearray()
+                            while True:
+                                chunk = resp.read(4096)
+                                if not chunk:
+                                    break
+                                captured_response_bytes.extend(chunk)
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                            if resp.status == 200 and is_interceptable and prompt_text:
+                                response_str = captured_response_bytes.decode("utf-8", errors="ignore")
+                                save_prompt_cache(prompt_text, response_str, is_stream_req)
+                        return
+                    except urllib.error.HTTPError as retry_err:
+                        e = retry_err
+                        decision = failover_decision(e.code, 1)
+                if decision == "failover" and is_interceptable and self.path.startswith("/v1/chat/completions"):
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     print(f"[{timestamp}] 🚨 \033[1;31mUpstream OpenAI Error {e.code} Intercepted!\033[0m")
                     print(f"👉 Activating Smart Model Failover Routing to Anthropic Claude-3.5...")
@@ -2400,9 +2803,15 @@ def start_gateway_server(host, port, scrub=True):
                         print(f"[{timestamp}] 🌐 \033[1;32mFailover Successful!\033[0m Returned Claude response seamlessly to client.")
                         print("-" * 50)
                         
-                        orig_tok, _ = count_tokens(prompt_text)
-                        input_price = load_prices().get("input_price_per_million", 3.0) / 1000000.0
-                        log_audit("FailoverRouting", f"failover:{model_name}->claude-3.5", orig_tok, 0, orig_tok * input_price, f"Failover OK ({e.code})", "tiktoken")
+                        usage = read_usage(failover_res) if not is_stream_req else None
+                        if usage:
+                            in_tok, out_tok, spent = usage["prompt_tokens"], usage["completion_tokens"], bill_from_usage(usage)
+                        else:
+                            in_tok, _ = count_tokens(prompt_text)
+                            out_tok = 0
+                            spent = in_tok * load_prices().get("input_price_per_million", 3.0) / 1000000.0
+                        print(f"  - Second bill:     ${spent:.5f}")
+                        log_audit("FailoverRouting", f"failover:{model_name}->claude-3.5", in_tok, out_tok, spent, f"Spent ${spent:.5f} ({e.code})", "provider")
                         
                         self.send_response(200)
                         if not is_stream_req:
@@ -2560,15 +2969,115 @@ def is_launch_at_login_enabled():
     return os.path.exists(PLIST_PATH)
 
 
+def host_platform():
+    prefix = os.environ.get("PREFIX", "")
+    if os.environ.get("ANDROID_ROOT") or prefix.startswith("/data/data/com.termux"):
+        return "android"
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return sys.platform
+
+
+def gateway_port_open(port=8799):
+    sock = socket.socket()
+    sock.settimeout(0.3)
+    try:
+        sock.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _port_check(python):
+    return "\"%s\" -c \"import socket;s=socket.socket();s.settimeout(0.3);s.connect(('127.0.0.1',8799))\"" % python
+
+
+def autostart_files(platform, home, root, python):
+    """Login files for one machine. Nothing is written."""
+    python = python or "python3"
+    engine = os.path.join(root, "tokenpinch.py")
+    host = os.path.join(root, "browser", "install_host.py")
+    check = _port_check(python)
+    if platform == "macos":
+        script = os.path.join(home, "Library/Application Support/TokenPinch/start-gateway.sh")
+        plist = os.path.join(home, "Library/LaunchAgents/com.tokenpinch.gateway.plist")
+        body = "#!/bin/sh\n%s >/dev/null 2>&1 && exit 0\n\"%s\" \"%s\" >/dev/null 2>&1 || true\nexec \"%s\" \"%s\" gateway --port 8799 </dev/null\n" % (check, python, host, python, engine)
+        agent = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.tokenpinch.gateway</string>
+<key>ProgramArguments</key><array><string>%s</string></array>
+<key>RunAtLoad</key><true/>
+</dict></plist>
+""" % script
+        return {script: body, plist: agent}
+    if platform == "windows":
+        cmd = os.path.join(home, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "TokenPinch.cmd")
+        body = "@echo off\r\n%s >nul 2>&1 && exit /b 0\r\n\"%s\" \"%s\"\r\nstart \"\" /min \"%s\" \"%s\" gateway --port 8799\r\n" % (check, python, host, python, engine)
+        return {cmd: body}
+    if platform == "android":
+        boot = os.path.join(home, ".termux", "boot", "tokenpinch.sh")
+        body = "#!/data/data/com.termux/files/usr/bin/sh\n# Android Chrome cannot load this browser companion. This starts the local gateway.\n%s >/dev/null 2>&1 && exit 0\nexec \"%s\" \"%s\" gateway --port 8799 </dev/null\n" % (check, python, engine)
+        return {boot: body}
+    return {}
+
+
+def install_autostart():
+    """Register login start on this machine and start the gateway if it is down."""
+    platform = host_platform()
+    root = os.path.dirname(os.path.abspath(__file__))
+    home = os.path.expanduser("~")
+    files = autostart_files(platform, home, root, sys.executable)
+    if not files:
+        print("No login start for platform %s." % platform)
+        return 1
+    for path, text in files.items():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="" if platform == "windows" else "\n") as fh:
+            fh.write(text)
+        if path.endswith((".sh", ".cmd")) or path.endswith("tokenpinch.sh"):
+            os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+    if platform != "android":
+        setup = os.path.join(root, "browser", "install_host.py")
+        subprocess.run([sys.executable, setup])
+    else:
+        print("Android browser companion: Chrome on Android has no native host. Gateway starts at Termux boot.")
+        print("Install the Termux:Boot app, then open Termux once after reboot.")
+    if platform == "macos":
+        plist = os.path.join(home, "Library/LaunchAgents/com.tokenpinch.gateway.plist")
+        uid = str(os.getuid())
+        subprocess.run(["launchctl", "bootout", "gui/%s/com.tokenpinch.gateway" % uid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        loaded = subprocess.run(["launchctl", "bootstrap", "gui/%s" % uid, plist])
+        if loaded.returncode != 0:
+            print("Login item written. It starts at the next login.")
+    print("Login start ready on %s." % platform)
+    for path in files:
+        print(path)
+    if gateway_port_open():
+        print("Gateway already listening on http://127.0.0.1:8799")
+    return 0
+
 def run_tray_app():
-    """Starts the native macOS Menu Bar Status/Tray App."""
+    """Menu bar on macOS. Gateway on Windows and Android."""
+    if host_platform() != "macos":
+        print("Menu bar is macOS. Gateway is the Windows and Android app.")
+        print("Listening on http://127.0.0.1:8799")
+        start_gateway_server("127.0.0.1", 8799, scrub=True)
+        return
     if not rumps:
         print("Error: 'rumps' library not found. Run 'pip3 install rumps' first.")
         sys.exit(1)
         
     class TokenPinchTrayApp(rumps.App):
         def __init__(self):
-            super(TokenPinchTrayApp, self).__init__("🤏 $0.00")
+            icon = menu_bar_icon_path()
+            super(TokenPinchTrayApp, self).__init__(
+                "TokenPinch", title="$0.00", icon=icon, template=True if icon else None
+            )
             self.menu = [
                 rumps.MenuItem("🤏 TokenPinch: $0.00 Saved", callback=None),
                 rumps.MenuItem("🔄 Active Runs: 0", callback=None),
@@ -2630,9 +3139,9 @@ def run_tray_app():
                 tokens_str = f"{total_tokens_saved}"
                 
             if total_tokens_saved > 0:
-                self.title = f"🤏 ${total_savings:.2f} Saved ({tokens_str} Tokens)"
+                self.title = f"${total_savings:.2f} Saved ({tokens_str} Tokens)"
             else:
-                self.title = f"🤏 $0.00 Saved"
+                self.title = "$0.00 Saved"
                 
             self.menu["🤏 TokenPinch: $0.00 Saved"].title = f"🤏 TokenPinch: ${total_savings:.2f} Saved"
             self.menu["🔄 Active Runs: 0"].title = f"🔄 Active Runs: {active_runs}"
@@ -2975,10 +3484,12 @@ def main():
         print("  \033[36mauto-heal\033[0m   Run compiler or test commands and isolate failing code.")
         print("  \033[36mscrub\033[0m       Scrub secrets and private data from a file directly.")
         print("  \033[36mgateway\033[0m     Launch the local proxy gateway to automatically scrub & optimize prompts.")
-        print("  \033[36mtray\033[0m        Launch the native macOS Menu Bar Status/Tray App in your task bar.")
+        print("  \033[36mtray\033[0m        macOS menu bar. On Windows and Android this starts the gateway.")
         print("  \033[36mstatus\033[0m      Show a beautiful visual Terminal UI (TUI) dashboard of savings.")
         print("  \033[36mclient\033[0m      Spit out instant copy-paste integration guides (cursor, vscode, python, node).")
-        print("  \033[36mdashboard\033[0m   Open the gorgeous HTML financial savings dashboard.\n")
+        print("  \033[36mdashboard\033[0m   Open the gorgeous HTML financial savings dashboard.")
+        print("  \033[36mbrowser-setup\033[0m  Install the browser companion native host.")
+        print("  \033[36mautostart\033[0m    Start the gateway at login on this Mac, Windows PC, or Android phone.\n")
         print("\033[1;32mOptions:\033[0m")
         print("  --no-scrub  Disable secret scrubbing filter.")
         print("  --exact     Query Anthropic API for exact Claude token count (needs ANTHROPIC_API_KEY).")
@@ -2986,7 +3497,12 @@ def main():
         sys.exit(1)
         
     subcmd = args[1].lower()
-    
+    if subcmd == "browser-setup":
+        setup = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser", "install_host.py")
+        raise SystemExit(subprocess.run([sys.executable, setup]).returncode)
+    if subcmd == "autostart":
+        raise SystemExit(install_autostart())
+
     # Standard license check for core operations
     verify_license()
     
@@ -3063,7 +3579,7 @@ def main():
         generate_dashboard()
         
     else:
-        print(f"Unknown subcommand '{subcmd}'. Commands: shrink, slice, squeeze, auto-heal, scrub, status, client, dashboard, gateway, tray")
+        print(f"Unknown subcommand '{subcmd}'. Commands: shrink, slice, squeeze, auto-heal, scrub, status, client, dashboard, gateway, tray, browser-setup, autostart")
         sys.exit(1)
 
 if __name__ == '__main__':
